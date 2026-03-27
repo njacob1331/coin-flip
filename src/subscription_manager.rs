@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -11,36 +11,56 @@ use tokio::task::JoinHandle;
 
 use crate::{
     api::{client::ApiClient, response::Contract},
-    market_state::{Market, MarketState},
-    orderbook::Orderbook,
     ws::message::Subscription,
 };
 
-pub struct Tracker {
+enum QueueItem {
+    Subscribe { contract: Contract, ts: Instant },
+    Unsubscribe { symbol: String, ts: Instant },
+}
+
+impl QueueItem {
+    fn symbol(&self) -> &str {
+        match self {
+            Self::Subscribe { contract, .. } => &contract.instrument_symbol,
+            Self::Unsubscribe { symbol, .. } => &symbol,
+        }
+    }
+
+    fn ts(&self) -> &Instant {
+        match self {
+            QueueItem::Subscribe { ts, .. } => ts,
+            QueueItem::Unsubscribe { ts, .. } => ts,
+        }
+    }
+
+    fn is_stale(&self) -> bool {
+        self.ts().elapsed() > Duration::from_secs(15)
+    }
+}
+
+pub struct SubscriptionManager {
     client: Arc<ApiClient>,
     ws_tx: AsyncSender<String>,
     resub_rx: AsyncReceiver<String>,
     ack_rx: AsyncReceiver<Subscription>,
-    market_state: Arc<MarketState>,
-    queue: HashMap<u32, String>,
+    queue: HashMap<u32, QueueItem>,
     subscriptions: HashMap<String, Contract>,
     next_id: u32,
 }
 
-impl Tracker {
+impl SubscriptionManager {
     pub fn new(
         client: Arc<ApiClient>,
         ws_tx: AsyncSender<String>,
         resub_rx: AsyncReceiver<String>,
         ack_rx: AsyncReceiver<Subscription>,
-        market_state: Arc<MarketState>,
     ) -> Self {
         Self {
             client,
             ws_tx,
             resub_rx,
             ack_rx,
-            market_state,
             queue: HashMap::new(),
             subscriptions: HashMap::new(),
             next_id: 1,
@@ -53,170 +73,145 @@ impl Tracker {
         id
     }
 
+    async fn send_ws_request(&mut self, method: &str, symbol: &str) -> Result<u32> {
+        println!("requesting '{method}' for: {symbol}");
+
+        let id = self.next_id();
+        let stream = format!("{symbol}@depth@100ms");
+        let request = json!({
+            "id": id,
+            "method": method,
+            "params": [stream],
+        })
+        .to_string();
+
+        self.ws_tx.send(request).await?;
+
+        Ok(id)
+    }
+
+    async fn subscribe(&mut self, contract: Contract) -> Result<()> {
+        match self
+            .send_ws_request("subscribe", &contract.instrument_symbol)
+            .await
+        {
+            Ok(id) => {
+                self.queue.insert(
+                    id,
+                    QueueItem::Subscribe {
+                        contract,
+                        ts: Instant::now(),
+                    },
+                );
+            }
+            Err(e) => {
+                eprintln!("failed to subscribe to {}: {e}", contract.instrument_symbol);
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn unsubscribe(&mut self, symbol: &str) -> Result<()> {
+        match self.send_ws_request("unsubscribe", symbol).await {
+            Ok(id) => {
+                self.queue.insert(
+                    id,
+                    QueueItem::Unsubscribe {
+                        symbol: symbol.to_string(),
+                        ts: Instant::now(),
+                    },
+                );
+            }
+            Err(e) => {
+                eprintln!("failed to un-subscribe from {}: {e}", symbol);
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn in_flight(&self, symbol: &str) -> bool {
+        self.queue.values().any(|v| v.symbol() == symbol)
+    }
+
     pub async fn refresh(&mut self) -> Result<()> {
+        self.queue.extract_if(|_, v| v.is_stale()).for_each(drop);
+
         let latest: Vec<Contract> = self
             .client
             .list_prediction_market_events()
             .await?
             .into_iter()
             .flat_map(|e| e.contracts)
+            .filter(|c| c.is_active())
             .collect();
 
-        let subscribe: HashSet<&str> = latest
-            .iter()
-            .map(|c| c.instrument_symbol.as_str())
+        let latest_symbols: HashSet<String> =
+            latest.iter().map(|c| c.instrument_symbol.clone()).collect();
+
+        for contract in latest {
+            if !self.subscriptions.contains_key(&contract.instrument_symbol)
+                && !self.in_flight(&contract.instrument_symbol)
+            {
+                let _ = self.subscribe(contract).await;
+            }
+        }
+
+        let stale_symbols: Vec<String> = self
+            .subscriptions
+            .keys()
+            .filter(|symbol| !latest_symbols.contains(symbol.as_str()))
+            .cloned()
             .collect();
 
-        let unsubscribe: Vec<String> = self.subscriptions.keys().cloned().collect();
-
-        for unsub in unsubscribe {
-            let _ = self.send_unsubscribe(unsub).await;
-        }
-
-        for sub in subscribe {
-            let _ = self.send_subscribe(symbol, contract)
+        for symbol in stale_symbols {
+            if !self.in_flight(&symbol) {
+                let _ = self.unsubscribe(&symbol).await;
+            }
         }
 
         Ok(())
     }
 
-    async fn send_subscribe(&mut self, symbol: String, contract: Contract) -> Result<()> {
-        let id = self.next_id();
-        let topic = format!("{symbol}@depth@100ms");
-
-        let request = json!({
-            "id": id,
-            "method": "subscribe",
-            "params": [topic],
-        })
-        .to_string();
-
-        println!("requesting subscription to: {symbol}");
-        self.queue.insert(id, symbol.clone());
-
-        if let Err(e) = self.ws_tx.send(request).await {
-            self.queue.remove(&id);
-        }
-
-        Ok(())
-    }
-
-    async fn send_unsubscribe(&mut self, symbol: String) -> Result<()> {
-        let id = self.next_id();
-        let topic = format!("{symbol}@depth@100ms");
-
-        let request = json!({
-            "id": id,
-            "method": "unsubscribe",
-            "params": [topic],
-        })
-        .to_string();
-
-        self.pending.insert(
-            id,
-            PendingAction::Unsubscribe {
-                symbol: symbol.clone(),
-            },
-        );
-
-        println!("requesting un-subscription from: {symbol}");
-        self.states.insert(symbol, SubState::Unsubscribing);
-
-        self.ws_tx.send(request).await?;
-        Ok(())
-    }
-
-    fn handle_ack(&mut self, ack: Subscription) {
-        let Some(action) = self.pending.remove(&ack.id) else {
+    fn manage_queue(&mut self, subscription: Subscription) {
+        let Some(item) = self.queue.remove(&subscription.id) else {
+            eprintln!("subscription with id '{}' not in queue", &subscription.id);
             return;
         };
 
-        if let Some(error) = ack.error {
-            eprintln!("subscription error: {}", error.msg);
-
+        if subscription.is_err() {
+            eprintln!("subscription error for '{}'", item.symbol());
             return;
         }
 
-        match action {
-            PendingAction::Subscribe { symbol, contract } => {
-                self.market_state
-                    .markets
-                    .insert(symbol.clone(), Market::new(contract));
-
-                println!("subscribed to: {symbol}");
-                self.states.insert(symbol, SubState::Subscribed);
-            }
-
-            PendingAction::Unsubscribe { symbol } => {
-                self.market_state.markets.remove(&symbol);
-                println!("un-subscribed from: {symbol}");
-                self.states.remove(&symbol);
-            }
-
-            PendingAction::Resubscribe { symbol } => {
-                println!("re-subscribed to: {symbol}");
-                self.states.insert(symbol, SubState::Subscribed);
-            }
-        }
-    }
-
-    async fn handle_resync(&mut self, symbol: String) -> Result<()> {
-        let Some(state) = self.states.get(&symbol) else {
-            return Ok(());
+        match item {
+            QueueItem::Subscribe { contract, .. } => self
+                .subscriptions
+                .insert(contract.instrument_symbol.clone(), contract),
+            QueueItem::Unsubscribe { symbol, .. } => self.subscriptions.remove(&symbol),
         };
-
-        if *state == SubState::Resyncing {
-            return Ok(()); // dedupe
-        }
-
-        // reset orderbook ONLY
-        if let Some(mut market) = self.market_state.markets.get_mut(&symbol) {
-            market.orderbook = Orderbook::new();
-        }
-
-        self.states.insert(symbol.clone(), SubState::Resyncing);
-
-        let id = self.next_id();
-        let topic = format!("{symbol}@depth@100ms");
-
-        let request = json!({
-            "id": id,
-            "method": "subscribe",
-            "params": [topic],
-        })
-        .to_string();
-
-        self.pending.insert(
-            id,
-            PendingAction::Resubscribe {
-                symbol: symbol.clone(),
-            },
-        );
-
-        self.ws_tx.send(request).await?;
-        Ok(())
     }
 
     pub fn spawn(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
+                    biased;
+
+                    Ok(sub) = self.ack_rx.recv() => {
+                        self.manage_queue(sub);
+                    }
+
                     _ = interval.tick() => {
                         if let Err(e) = self.refresh().await {
                             eprintln!("refresh error: {e}");
                         }
-                    }
-
-                    Ok(symbol) = self.resub_rx.recv() => {
-                        if let Err(e) = self.handle_resync(symbol).await {
-                            eprintln!("resync error: {e}");
-                        }
-                    }
-
-                    Ok(ack) = self.ack_rx.recv() => {
-                        self.handle_ack(ack);
                     }
                 }
             }

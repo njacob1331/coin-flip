@@ -18,11 +18,36 @@ pub struct SubscriptionError {
     pub msg: String,
 }
 
+// #[derive(Debug, Clone, Deserialize)]
+// pub enum Subscription {
+//     Ok {
+//         id: u32,
+//         status: i16,
+//     },
+//     Error {
+//         id: u32,
+//         status: i16,
+//         error: Option<SubscriptionError>,
+//     },
+// }
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Subscription {
     pub id: u32,
     pub status: i16,
     pub error: Option<SubscriptionError>,
+}
+
+impl Subscription {
+    pub fn is_err(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PriceLevel {
+    price: Decimal,
+    quantity: Decimal,
 }
 
 #[serde_as]

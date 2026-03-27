@@ -41,4 +41,12 @@ impl Contract {
     pub fn eq(&self, symbol: &str) -> bool {
         self.instrument_symbol == symbol
     }
+
+    pub fn is_expired(&self) -> bool {
+        self.expiry_date.is_some_and(|e| Utc::now() >= e)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
+    }
 }
