@@ -1,3 +1,7 @@
+// to-do
+// seperate api refresh call into its own task
+// SubscriptionManager becomes a consumer of messages from the api refresher
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
